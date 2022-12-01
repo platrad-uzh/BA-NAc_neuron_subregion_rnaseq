@@ -1,0 +1,537 @@
+---
+title: "Data Analysis - Transcriptional differences between int-BLA-NAc and p-BLA-NAc neurons (no outliers)"
+author: "Gregorio Alanis-Lobato"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning=FALSE, message=FALSE)
+
+library(SummarizedExperiment)
+library(mclust)
+library(enrichR)
+library(pheatmap)
+library(PCAtools)
+library(ggplot2)
+library(ggrepel)
+library(viridis)
+library(patchwork)
+library(DESeq2)
+library(dplyr)
+
+set.seed(42)
+
+```
+
+# Introduction
+
+This report contains the downstream bioinformatics analysis for the paper *Basal amygdala-nucleus accumbens glutamate neurons respond to either social reward or social aversion* by Poggi *et al.*
+
+```{r se_construction}
+# Retrieve gene expression data
+se_exp <- readRDS("data/intBA-NAc_pBA-NAc_Glu_neurons_mmu_Pryce_SE.rds")
+
+# Remove outliers (see explanation in text)
+se_exp <- se_exp[, !se_exp$sampleName %in% c("1054_0019", "1054_0026")]
+
+```
+
+The aim of this transcriptomics experiment was to investigate whether int-BA-NAc and post-BA-NAc glutamate neurons display consistent differences with respect to gene expression and, if yes, with which ontological pathways these genes are associated. 
+
+BL/6 mice were injected in NAc core/shell (+1.0-1.2) with CTB-555. After 29 days, mice were perfused with phosphate buffered saline to rinse blood from the brains, and the latter were fresh frozen. Coronal sections (10 um) including int-BA (-1.6 to -2.0) or post-BA (-2.3 to -2.6) were collected onto PET membrane slides (MMI). Circular areas (diameter = 35 µm) of CTB-555+ BA tissue were demarcated and collected using laser capture microdissection (CellCut, MMI), 500 per mouse, and QIAzol was added for tissue lysis. RNA extraction was conducted, and low-input RNA sequencing libraries were prepared with the SMART-seq v4 FLX protocol. Sequencing was conducted with the Illumina NovaSeq platform.
+
+# Notes about sample quality
+
+The Genomics facility flagged sample run2_mouse6 (1054_0019) as a potential outlier because its RNA QC showed higher concentration than expected (3 times higher). Although 1054_0019 was diluted to the appropriate normalised input amount as the rest of the samples (ca. 1ng RNA input), its post-sequencing QC showed higher yield and mapping to coding regions, as well as lower duplication rate.
+
+Sample run2_mouse14 (1054_0026) was also identified as an outlier due to its low expression signal for the glutamate neuron gene marker Slc17a7.
+
+
+# Quality control - Exp II and Exp IV controls
+
+## Identification of expressed genes
+
+We identified expressed genes based on the distribution of median expression values across samples using a Gaussian mixture model as above.
+
+```{r gene_filtering_merge}
+
+# Identify expressed and non-expressed genes via Gaussian mixture model on
+# the median log2 counts  across samples
+median_across_samples <- apply(log2(assay(se_exp, "counts") + 1), 1, median)
+g_mm <- Mclust(median_across_samples, G = 2, verbose = FALSE)
+keep <- which(g_mm$classification == 2)
+
+# Show the model on top of the distribution of medians
+MineICA::plotMix(mc=g_mm, data=median_across_samples, nbBreaks=50)
+```
+
+## Normalisation
+
+Then, we normalised the gene expression matrix using the [variance stabilizing transformation (VST)](https://www.bioconductor.org/packages/devel/workflows/vignettes/rnaseqGene/inst/doc/rnaseqGene.html#the-variance-stabilizing-transformation-and-the-rlog) and identified the 500 highest variable genes (HVGs) for Principal Component Analysis (PCA).
+
+```{r dds_creation_merge}
+# Focus on expressed genes
+se_exp <- se_exp[keep, ]
+
+# Define a Group variable for differential gene expression analysis based on the BA subregion
+se_exp$Group <- factor(se_exp$subregion)
+se_exp$Group <- relevel(se_exp$Group, "pBA_NAc") # Originally was Control_ExpII
+
+# DESeq object construction
+dds_merge <- DESeqDataSet(se_exp, design = ~ Group)
+
+# Variance stabilizing transformation
+vsd_merge <-  vst(dds_merge, blind = FALSE)
+
+# Highly variable genes based on highest row variance
+hvg_merge <- head(names(sort(apply(assay(vsd_merge), 1, var), decreasing = T)), 500)
+
+```
+
+## Principal Component Analysis
+
+The following plot shows the data samples in PCA space (PC1 vs PC2) based on the normalised expression matrix and the set of HVGs identified above.
+
+```{r pca2}
+p <- pca(mat = assay(vsd_merge)[hvg_merge, ], metadata = colData(vsd_merge))
+biplot(p, 
+       lab = p$metadata$sampleName,
+       colby = "Group",
+       hline = 0, vline = 0,
+       legendPosition = "right",
+       legendLabSize = 9,
+       legendIconSize = 2.5)
+```
+
+The PCA plot shows a clear separation between the samples from the int-BA-NAc and the samples from the p-BA-NAc on PC1. However, the eigencor plot below suggests that `quant_ng_uL` could be a technical factor driving this separation because, in addition to the `Group` variable, it shows a significant correlation with PC1.
+
+```{r ecor2}
+eigencorplot(p,
+             metavars = c("Group", "RNA.Extraction.Date", "Cell.count", 
+                          "Body.weight", "Date.brain.collection", 
+                          "quant_ng_uL", "lib_quant_nM", "lib_size", "batch"),
+             fontLabX = 1.5,
+             fontLabY = 1.5)
+```
+
+The following plots show that there are indeed concentration differences between samples from int-BA-NAc and samples from p-BA-NAc.
+
+```{r batch_diff}
+p_lib <- ggplot(as_tibble(colData(se_exp)), aes(Group, lib_size)) +
+  ggbeeswarm::geom_quasirandom(width = 0.25) +
+  labs(x = "", y = "Library size") +
+  theme_bw()
+
+p_quant <- ggplot(as_tibble(colData(se_exp)), aes(Group, quant_ng_uL)) +
+  ggbeeswarm::geom_quasirandom(width = 0.25) +
+  labs(x = "", y = "Quant. (ng/uL)") +
+  theme_bw()
+
+p_lib + p_quant
+```
+
+Therefore, it is important to account for this sources of variation in the differential gene expression analysis, which is what we do below.
+
+```{r dds_batch_merge}
+# DESeq object construction
+dds_merge <- DESeqDataSet(se_exp, design = ~ quant_ng_uL + Group)
+
+```
+
+
+## Expression of markers
+
+The following PCA plot shows the level of expression of different cell type markers in each sample:
+
+```{r mrk_merge, fig.height=25, fig.width=10}
+mrk <- tibble(marker = c("Snap25", "Slc17a7", "Gad1", "Aqp4", 
+                         "Opalin", "Pdgfra", "Ctss", "Ppp1r1b", "Rspo2"),
+              ensembl = c("ENSMUSG00000027273", "ENSMUSG00000070570", 
+                          "ENSMUSG00000070880", "ENSMUSG00000024411", 
+                          "ENSMUSG00000050121", "ENSMUSG00000029231", 
+                          "ENSMUSG00000038642", "ENSMUSG00000061718", 
+                          "ENSMUSG00000051920"),
+              ctype = c("Neuron", "Glutamate", "GABA", "Astrocyte", 
+                        "Oligodendrocyte", "OPC", "Microglia", "Reward", "Aversion"))
+p_tb <- tibble(PC1 = p$rotated$PC1, 
+               PC2 = p$rotated$PC2, 
+               group = p$metadata$Group)
+p_mrk <- list()
+for(i in 1:nrow(mrk)){
+  p_tb$expr <- assay(vsd_merge)[mrk$ensembl[i], ]
+  p_mrk[[i]] <- ggplot(p_tb, aes(x = PC1, y = PC2, 
+                                 colour = expr, shape = group)) + 
+    geom_point(size = 3) + 
+    scale_colour_viridis(limits = c(0, 15)) +
+    labs(x = paste0("PC1 (", round(p$variance[1], 2), "%)"),
+         y = paste0("PC1 (", round(p$variance[2], 2), "%)"),
+         colour = "VST",
+         title = paste0(mrk$marker[i], " - ", mrk$ctype[i])) +
+    theme_bw()
+}
+p_mrk[[10]] <- guide_area()
+wrap_plots(p_mrk, nrow = 5, ncol = 2) + 
+  plot_layout(guides = "collect")
+
+# RUN TO SAVE THE EXPRESSION OF MARKERS ACROSS SAMPLES
+expr_tb_vst <- as_tibble(colData(se_exp)) %>% 
+  dplyr::select(sampleName, Group, Sample.ID.TA)
+expr_tb_tpm <- expr_tb_vst
+
+for(i in 1:nrow(mrk)){
+  varname <- mrk$ensembl[i]
+  expr_tb_vst <- expr_tb_vst %>%
+    mutate(!!paste0(varname, "_", mrk$marker[i]) :=  assay(vsd_merge)[varname, ])
+  expr_tb_tpm <- expr_tb_tpm %>%
+    mutate(!!paste0(varname, "_", mrk$marker[i]) :=  assay(se_exp, "tpm")[varname, ])
+}
+
+expr_tb_vst <- expr_tb_vst %>%
+  arrange(Group)
+
+expr_tb_tpm <- expr_tb_tpm %>%
+  arrange(Group)
+
+readr::write_csv(expr_tb_vst, file = "results/intBA_pBA_mrk_VST.csv")
+readr::write_csv(expr_tb_tpm, file = "results/intBA_pBA_mrk_TPM.csv")
+
+```
+
+
+# Differential gene expression analysis - int-BA-NAc and p-BA-NAc
+
+## Exp II Control vs Exp IV Control
+
+The differential gene expression analysis comparing int-BA-NAc vs p-BA-NAc groups led to 1819 dysregulated genes (|log2 fold-change| > 0, FDR < 10%). 
+
+```{r dgea_merge}
+dds_merge <- DESeq(dds_merge)
+res_merge <- results(dds_merge)
+summary(res_merge)
+```
+
+The following table lists the results of this analysis sorted by FDR (`padj`). Note that the top-1819 genes are the significantly dysregulated genes mentioned above. Only genes with raw p-values < 0.05 are included:
+
+```{r res_merge}
+res_mfgroup <- as_tibble(res_merge, rownames = "ensg") %>% 
+  left_join(as_tibble(rowData(se_exp)), by = "ensg") %>% 
+  dplyr::select(ensg, symbol, baseMean, log2FoldChange, pvalue, padj) %>%
+  dplyr::rename(logFC = log2FoldChange,
+                avgExpr = baseMean) %>% 
+  filter(pvalue < 0.05) %>% 
+  arrange(padj, pvalue, desc(logFC))
+
+DT::datatable(res_mfgroup,
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "intBA_pBA_dgea")
+                                            )
+                             )
+              ) %>% 
+  DT::formatRound("logFC", 3) %>% 
+  DT::formatSignif("pvalue", 3) %>% 
+  DT::formatSignif("padj", 3) %>% 
+  DT::formatRound("avgExpr", 3)
+```
+
+
+# Functional enrichment analysis - int-BA-NAc and p-BA-NAc
+
+The following subsections report the results of the functional enrichment analyses carried out with lists of genes extracted from the above table. Gene inclusion in the analyses was based on the thresholds specified in the titles of each subsection. Note that this doesn't mean that differential expression analysis was re-run with these thresholds but that the above tables were filtered with them.
+
+## int-BA-NAc vs p-BA-NAc (|log2 fold-change| > 0, FDR < 0.1)
+
+- `r sum(filter(res_mfgroup, abs(logFC) > 0 & padj < 0.1)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_mfgroup, abs(logFC) > 0 & padj < 0.1)$logFC < 0)` down-regulated genes.
+
+```{r fea_merge_cutoff1}
+sig_genes <- res_mfgroup %>% 
+  filter(abs(logFC) > 0 & padj < 0.1) %>%
+  pull(symbol)
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+```
+
+### GO Biological Process
+
+```{r bp_merge_cutoff1}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_merge_cutoff1}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_merge_cutoff1}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_merge_cutoff1}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+## int-BA-NAc vs p-BA-NAc (|log2 fold-change| > 0.5, p < 0.001)
+
+- `r sum(filter(res_mfgroup, abs(logFC) > 0.5 & pvalue < 0.001)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_mfgroup, abs(logFC) > 0.5 & pvalue < 0.001)$logFC < 0)` down-regulated genes.
+
+```{r fea_merge_cutoff2}
+sig_genes <- res_mfgroup %>% 
+  filter(abs(logFC) > 0.5 & pvalue < 0.001) %>%
+  pull(symbol)
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+```
+
+### GO Biological Process
+
+```{r bp_merge_cutoff2}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_merge_cutoff2}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_merge_cutoff2}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_merge_cutoff2}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+## int-BA-NAc vs p-BA-NAc (|log2 fold-change| > 0.5, p < 0.01)
+
+- `r sum(filter(res_mfgroup, abs(logFC) > 0.5 & pvalue < 0.01)$logFC > 0)` up-regulated genes.
+- `r sum(filter(res_mfgroup, abs(logFC) > 0.5 & pvalue < 0.01)$logFC < 0)` down-regulated genes.
+
+```{r fea_merge_cutoff3}
+sig_genes <- res_mfgroup %>% 
+  filter(abs(logFC) > 0.5 & pvalue < 0.01) %>%
+  pull(symbol)
+
+out_enrichr <- enrichr(sig_genes,
+                       databases = c("KEGG_2019_Mouse", 
+                      "GO_Biological_Process_2018", 
+                      "GO_Molecular_Function_2018", 
+                      "Reactome_2016"))
+```
+
+### GO Biological Process
+
+```{r bp_merge_cutoff3}
+DT::datatable(subset(out_enrichr$GO_Biological_Process_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "bp_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### GO Molecular Function
+
+```{r mf_merge_cutoff3}
+DT::datatable(subset(out_enrichr$GO_Molecular_Function_2018[, c("Term",
+                                                                "Adjusted.P.value", 
+                                                                "Overlap", 
+                                                                "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "mf_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### KEGG
+
+```{r kegg_merge_cutoff3}
+DT::datatable(subset(out_enrichr$KEGG_2019_Mouse[, c("Term",
+                                                     "Adjusted.P.value", 
+                                                     "Overlap", 
+                                                     "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "kegg_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+### Reactome
+
+```{r reac_merge_cutoff3}
+DT::datatable(subset(out_enrichr$Reactome_2016[, c("Term",
+                                                   "Adjusted.P.value", 
+                                                   "Overlap",
+                                                   "Genes")], 
+                     subset = Adjusted.P.value <= 0.1),
+              extensions = "Buttons", 
+              options = list(dom = "Bfrtip", 
+                             buttons = list("copy", 
+                                            list(extend = "excel", 
+                                                 filename = "react_intBA_pBA")
+                                            )
+                             )
+              ) %>% 
+  DT::formatSignif("Adjusted.P.value", 3)
+```
+
+
+```{r export_tpm}
+# int-BA and pBA neurons
+tpm_mtx <- assay(se_exp, "tpm")
+colnames(tpm_mtx) <- paste0(se_exp$sampleName, "_", se_exp$MFGroup)
+rownames(tpm_mtx) <- paste0(rowData(se_exp)$ensg, "_", rowData(se_exp)$symbol)
+as_tibble(tpm_mtx, rownames = "gene") %>% 
+  readr::write_csv("results/intBA-pBA_TPM.csv")
+```
